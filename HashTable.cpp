@@ -224,8 +224,7 @@ bool HashTable::save(std::string filename, std::string key) {
     // Encrypt
     std::string encryptedData = xorCipher(buffer, key);
 
-    // If OpenSSL available, write new format (MAGIC + HMAC + payload) atomically.
-#if HASH_HAS_OPENSSL
+    // Always write new format (MAGIC + HMAC + payload) atomically for integrity
     // Compute HMAC over encrypted payload
     std::string hmac = computeHMAC_SHA256(encryptedData, key);
     if (hmac.size() != HMAC_SIZE) {
@@ -253,14 +252,6 @@ bool HashTable::save(std::string filename, std::string key) {
         return false;
     }
     return true;
-#else
-    // Fallback: old behavior (just write encrypted payload directly)
-    std::ofstream outFile(filename, std::ios::binary | std::ios::trunc);
-    if (!outFile.is_open()) return false;
-    outFile.write(encryptedData.data(), static_cast<std::streamsize>(encryptedData.size()));
-    outFile.close();
-    return true;
-#endif
 }
 
 // DSA8: Load
@@ -279,92 +270,61 @@ bool HashTable::load(std::string filename, std::string key) {
         return true; // empty file -> nothing to load
     }
 
-    // If OpenSSL available, expect new format (MAGIC + HMAC + payload). Otherwise treat entire file as payload.
-#if HASH_HAS_OPENSSL
+    // Always expect new format (MAGIC + HMAC + payload) for integrity/auth
+    if (static_cast<size_t>(size) < FILE_MAGIC_SIZE + HMAC_SIZE) {
+        inFile.close();
+        return false; // File too small to be valid format
+    }
+
     // Read magic first
-    if (static_cast<size_t>(size) >= FILE_MAGIC_SIZE) {
-        std::string magicBuf(FILE_MAGIC_SIZE, '\0');
-        inFile.read(&magicBuf[0], FILE_MAGIC_SIZE);
-        if (inFile.gcount() != static_cast<std::streamsize>(FILE_MAGIC_SIZE)) {
+    std::string magicBuf(FILE_MAGIC_SIZE, '\0');
+    inFile.read(&magicBuf[0], FILE_MAGIC_SIZE);
+    if (inFile.gcount() != static_cast<std::streamsize>(FILE_MAGIC_SIZE)) {
+        inFile.close();
+        return false;
+    }
+
+    if (std::memcmp(magicBuf.data(), FILE_MAGIC, FILE_MAGIC_SIZE) != 0) {
+        inFile.close();
+        return false; // Magic header mismatch: file corrupted or wrong format
+    }
+
+    // Read HMAC
+    std::string fileHmac(HMAC_SIZE, '\0');
+    inFile.read(&fileHmac[0], HMAC_SIZE);
+    if (inFile.gcount() != static_cast<std::streamsize>(HMAC_SIZE)) {
+        inFile.close();
+        return false;
+    }
+
+    // Read payload
+    std::streamsize payloadSize = size - static_cast<std::streamsize>(FILE_MAGIC_SIZE + HMAC_SIZE);
+    std::string encryptedData(static_cast<size_t>(payloadSize), '\0');
+    if (payloadSize > 0) {
+        inFile.read(&encryptedData[0], payloadSize);
+        if (inFile.gcount() != payloadSize) {
             inFile.close();
             return false;
         }
-
-        if (std::memcmp(magicBuf.data(), FILE_MAGIC, FILE_MAGIC_SIZE) == 0) {
-            // New format: read HMAC then payload
-            if (static_cast<size_t>(size) < FILE_MAGIC_SIZE + HMAC_SIZE) {
-                inFile.close();
-                return false;
-            }
-            std::string fileHmac(HMAC_SIZE, '\0');
-            inFile.read(&fileHmac[0], HMAC_SIZE);
-            std::streamsize payloadSize = size - static_cast<std::streamsize>(FILE_MAGIC_SIZE + HMAC_SIZE);
-            std::string encryptedData(static_cast<size_t>(payloadSize), '\0');
-            if (payloadSize > 0) {
-                inFile.read(&encryptedData[0], payloadSize);
-                if (inFile.gcount() != payloadSize) {
-                    inFile.close();
-                    return false;
-                }
-            }
-            inFile.close();
-
-            // Verify HMAC
-            std::string calcHmac = computeHMAC_SHA256(encryptedData, key);
-            if (calcHmac.size() != fileHmac.size() || calcHmac != fileHmac) {
-                return false; // integrity/auth failed
-            }
-
-            // Decrypt and parse
-            std::string decryptedData = xorCipher(encryptedData, key);
-            std::stringstream ss(decryptedData);
-            std::string line;
-            while (std::getline(ss, line)) {
-                if (!line.empty() && line.length() > 5) {
-                    insert(Credential::fromCSV(line));
-                }
-            }
-            return true;
-        }
-        // Not new format; fall through to old format handling by seeking to beginning
-        inFile.clear();
-        inFile.seekg(0, std::ios::beg);
-    }
-
-    // Old format (no magic): read entire file as encryptedData and decrypt
-    std::string encryptedData(static_cast<size_t>(size), '\0');
-    if (inFile.read(&encryptedData[0], size)) {
-        inFile.close();
-        std::string decryptedData = xorCipher(encryptedData, key);
-        std::stringstream ss(decryptedData);
-        std::string line;
-        while (std::getline(ss, line)) {
-            if (!line.empty() && line.length() > 5) {
-                insert(Credential::fromCSV(line));
-            }
-        }
-        return true;
     }
     inFile.close();
-    return false;
-#else
-    // Fallback: no OpenSSL, read entire file as encrypted payload
-    std::string encryptedData(static_cast<size_t>(size), '\0');
-    if (inFile.read(&encryptedData[0], size)) {
-        inFile.close();
-        std::string decryptedData = xorCipher(encryptedData, key);
-        std::stringstream ss(decryptedData);
-        std::string line;
-        while (std::getline(ss, line)) {
-            if (!line.empty() && line.length() > 5) {
-                insert(Credential::fromCSV(line));
-            }
-        }
-        return true;
+
+    // Verify HMAC (always, regardless of OpenSSL)
+    std::string calcHmac = computeHMAC_SHA256(encryptedData, key);
+    if (calcHmac.size() != fileHmac.size() || calcHmac != fileHmac) {
+        return false; // integrity/auth failed: wrong key or file corrupted
     }
-    inFile.close();
-    return false;
-#endif
+
+    // Decrypt and parse
+    std::string decryptedData = xorCipher(encryptedData, key);
+    std::stringstream ss(decryptedData);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.length() > 5) {
+            insert(Credential::fromCSV(line));
+        }
+    }
+    return true;
 }
 
 // Clears all entries from the hash table (keeps capacity)

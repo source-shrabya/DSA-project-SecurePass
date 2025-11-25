@@ -2,6 +2,8 @@
 #include <cstdio>
 #include <string>
 #include "HashTable.h"
+#include "HashNode.h"
+#include "sha256.h"
 #include "Credential.h"
 
 int main() {
