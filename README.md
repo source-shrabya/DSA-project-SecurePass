@@ -21,7 +21,6 @@ A lightweight password manager built with C++ and data structures. Stores creden
 ├── HashNode.h            # Linked list node for chaining
 ├── Credential.h/.cpp     # Credential class (site, user, pass) + CSV serialization
 ├── sha256.h/.cpp         # Embedded SHA-256 implementation
-├── test_hash.cpp         # Unit test suite
 └── README.md             # This file
 ```
 
